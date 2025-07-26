@@ -30,7 +30,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Clone the repository and move into it:
 
 ```bash
-git clone <repo-url> data_collector
+git clone https://github.com/johnmalek312/android_ui_collector data_collector
 cd data_collector
 ```
 
@@ -69,7 +69,7 @@ The main window will open. Press **“Take Screenshot”** to grab the current s
 
 1. Click **four** times to place the square corners (dots + connecting lines are shown).
 2. Fill in a textual description.
-3. Click **Save** – the image is written to `~/Desktop/Images/` and the annotation appended to `annotations.json` in that same folder.
+3. Click **Save** – the image is written to `~/Desktop/Images/` with a timestamped filename (e.g. `screenshot_1689850092.png`) and the annotation appended to `annotations.json` in that same folder.
 
 Undo/redo and zoom shortcuts are provided in the toolbar.
 
@@ -82,6 +82,7 @@ Each entry in `annotations.json` looks like:
 ```json
 {
   "screenshot": "screenshot_1689850092.png",
+  "timestamp": 1689850092,
   "points": [
     {"x": 0.123, "y": 0.456},
     {"x": 0.789, "y": 0.456},

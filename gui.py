@@ -342,6 +342,7 @@ class MainWindow(QMainWindow):
 
         entry: Dict[str, Any] = {
             "screenshot": self.current_screenshot_path.name,
+            "timestamp": int(time.time()),
             "points": points_payload,
             "description": desc,
         }
