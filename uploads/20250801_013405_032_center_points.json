@@ -1,0 +1,29 @@
+[
+  {
+    "screenshot": "screenshot_1753975967.png",
+    "timestamp": 1753975974,
+    "center_point": {
+      "x": 0.592593,
+      "y": 0.673077
+    },
+    "description": "test point"
+  },
+  {
+    "screenshot": "screenshot_1753975992.png",
+    "timestamp": 1753975998,
+    "center_point": {
+      "x": 0.529915,
+      "y": 0.530769
+    },
+    "description": "test point2"
+  },
+  {
+    "screenshot": "screenshot_1753976038.png",
+    "timestamp": 1753976045,
+    "center_point": {
+      "x": 0.723647,
+      "y": 0.49359
+    },
+    "description": "testpoint3"
+  }
+]

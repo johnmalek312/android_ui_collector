@@ -14,14 +14,15 @@ Features:
 This file purposefully avoids tkinter in favour of PyQt5.
 """
 
-import json
 import os
+import json
 import time
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
+import requests
 
 from PyQt5.QtCore import Qt, QPoint, pyqtSignal
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QImage, QFontMetrics
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QImage, QFontMetrics, QKeySequence
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -34,6 +35,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QScrollArea,
     QDoubleSpinBox,
+    QShortcut,  # Added for keyboard shortcuts
 )
 
 from adb import AdbTools  # Local module
@@ -41,7 +43,10 @@ from adb import AdbTools  # Local module
 
 IMAGES_DIR = Path(os.path.expanduser("~/Desktop/Images"))
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
-ANNOTATIONS_PATH = IMAGES_DIR / "annotations.json"
+
+# Only use cumulative JSON files - no individual files
+CUBE_ANNOTATIONS_PATH = IMAGES_DIR / "cube_annotations.json"
+CENTER_POINTS_PATH = IMAGES_DIR / "center_points.json"
 
 
 class ClickableLabel(QLabel):
@@ -122,6 +127,19 @@ class MainWindow(QMainWindow):
         self.zoom_in_btn.clicked.connect(lambda: self._zoom(1.25))
         self.zoom_out_btn.clicked.connect(lambda: self._zoom(0.8))
 
+        # Keyboard shortcuts for zoom in/out
+        self.zoom_in_shortcut = QShortcut(QKeySequence("Ctrl+="), self)
+        self.zoom_in_shortcut.activated.connect(lambda: self._zoom(1.25))
+        self.zoom_out_shortcut_minus = QShortcut(QKeySequence("Ctrl+-"), self)
+        self.zoom_out_shortcut_minus.activated.connect(lambda: self._zoom(0.8))
+        self.zoom_out_shortcut_underscore = QShortcut(QKeySequence("Ctrl+_"), self)
+        self.zoom_out_shortcut_underscore.activated.connect(lambda: self._zoom(0.8))
+
+        # Center point buttons
+        self.cancel_center_btn = QPushButton("Cancel Center Point")  # Button to cancel center point
+        self.cancel_center_btn.clicked.connect(self.cancel_center_point)
+        self.cancel_center_btn.setEnabled(False)
+
         self.save_btn = QPushButton("Save")
         self.cancel_btn = QPushButton("Cancel")
 
@@ -167,6 +185,23 @@ class MainWindow(QMainWindow):
 
         annot_layout.addLayout(points_grid)
 
+        # Center point spin boxes
+        center_point_layout = QHBoxLayout()
+        center_point_layout.addWidget(QLabel("Center Point:"))
+        self.center_x_spin = QDoubleSpinBox()
+        self.center_y_spin = QDoubleSpinBox()
+        for sp in (self.center_x_spin, self.center_y_spin):
+            sp.setDecimals(3)
+            sp.setRange(0.0, 1.0)
+            sp.setSingleStep(0.001)
+            sp.setEnabled(False)
+        # Connect updates
+        self.center_x_spin.valueChanged.connect(self.on_center_spin_changed)
+        self.center_y_spin.valueChanged.connect(self.on_center_spin_changed)
+        center_point_layout.addWidget(self.center_x_spin)
+        center_point_layout.addWidget(self.center_y_spin)
+        annot_layout.addLayout(center_point_layout)
+
         self.desc_input = QTextEdit()
         self.desc_input.setPlaceholderText("Enter description…")
         # Auto-resizing: start at 2 lines and grow with content
@@ -174,6 +209,8 @@ class MainWindow(QMainWindow):
         self._set_desc_height(self.desc_min_lines)
         self.desc_input.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.desc_input.textChanged.connect(self.adjust_desc_height)
+        self.desc_input.textChanged.connect(self.check_description_for_center_point)  # Add this connection
+        self.desc_input.textChanged.connect(self.update_save_button_state)  # Add this connection for cube annotations
         self.desc_input.setEnabled(False)
 
         annot_layout.addWidget(self.desc_input)
@@ -196,10 +233,21 @@ class MainWindow(QMainWindow):
         self._drag_index: int | None = None  # Index of point being dragged
         self.last_description: str = ""  # Track last saved description
         self.last_saved_screenshot: str | None = None  # Track last saved screenshot filename
+        
+        # Center point functionality
+        self.center_point: tuple[float, float] | None = None  # Normalized center point coordinates
+        self.center_point_mode: bool = False  # Whether we're in center point mode
 
     # ----------------- GUI Slots -----------------
     def handle_take_screenshot(self):
         """Capture screenshot, save to disk & display."""
+        # Prevent taking new screenshot if in center point mode or center point exists but not saved
+        if self.center_point is not None:
+            QMessageBox.warning(self, "Warning", 
+                              "Please complete the center point process first.\n"
+                              "Either save the center point or cancel the current annotation.")
+            return
+        
         try:
             fmt, img_bytes = self.adb_tools.take_screenshot()
         except Exception as exc:  # pylint: disable=broad-except
@@ -269,6 +317,19 @@ class MainWindow(QMainWindow):
                 self._drag_index = idx
                 self._record_state_for_undo()
                 return  # Dragging will be handled in handle_drag_move
+        
+        # Handle center point movement - if we have a center point, clicking anywhere moves it
+        if self.center_point is not None:
+            self.center_point = (round(x_norm, 6), round(y_norm, 6))
+            # Update center point spin boxes
+            self.center_x_spin.blockSignals(True)
+            self.center_y_spin.blockSignals(True)
+            self.center_x_spin.setValue(x_norm)
+            self.center_y_spin.setValue(y_norm)
+            self.center_x_spin.blockSignals(False)
+            self.center_y_spin.blockSignals(False)
+            self._redraw_preview()
+            return
 
         # Append point (max 4)
         if len(self.pending_points) >= 4:
@@ -289,75 +350,117 @@ class MainWindow(QMainWindow):
         self._update_action_buttons()
 
     def handle_save_annotation(self):
-        """Persist the pending annotation and finalise dot."""
-        if (
-            len(self.pending_points) != 4
-            or self.image_label.pixmap() is None
-        ):
+        """Persist the pending annotation and center point."""
+        # If we have 4 points, save cube annotation first
+        if len(self.pending_points) == 4 and self.image_label.pixmap() is not None:
+            desc = self.desc_input.toPlainText().strip()
+            if not desc:
+                QMessageBox.warning(self, "Warning", "Please enter a description.")
+                return
+
+            # Ensure screenshot is saved to get path for duplicate check
+            if self.current_screenshot_path is None:
+                if self.current_img_bytes is None:
+                    QMessageBox.critical(self, "Error", "No image data available to save.")
+                    return
+                timestamp = int(time.time())
+                filename = f"screenshot_{timestamp}.png"
+                img_path = IMAGES_DIR / filename
+                try:
+                    with open(img_path, "wb") as f:
+                        f.write(self.current_img_bytes)
+                except OSError as exc:
+                    QMessageBox.critical(self, "Error", f"Failed to save image: {exc}")
+                    return
+                self.current_screenshot_path = img_path
+
+            # Confirm if description unchanged for same screenshot
+            if (
+                desc == self.last_description
+                and self.current_screenshot_path is not None
+                and self.last_saved_screenshot == self.current_screenshot_path.name
+                and desc != ""
+            ):
+                reply = QMessageBox.question(
+                    self,
+                    "Confirm Save",
+                    "You have already used this description. Save again with the same description?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply == QMessageBox.No:
+                    return
+
+            # Points list is finalised
+            points_payload = [
+                {"x": p[0], "y": p[1]} for p in self.pending_points
+            ]
+
+            entry: Dict[str, Any] = {
+                "screenshot": self.current_screenshot_path.name,
+                "timestamp": int(time.time()),
+                "points": points_payload,
+                "description": desc,
+            }
+            # Save cube annotation to cumulative file
+            self._append_cube_annotation(entry)
+
+            # Commit the temp pixmap as new base
+            self.base_pixmap = self.image_label.pixmap().copy()
+
+            # Remember last description and screenshot
+            self.last_description = desc
+            if self.current_screenshot_path is not None:
+                self.last_saved_screenshot = self.current_screenshot_path.name
+
+            # Clear input state
+            self._reset_input_section()
+            
+            # Calculate and display center point after saving annotation
+            self._calculate_center_point(points_payload)
+            
+            # Clear the description and require a new one for center point
+            self.desc_input.clear()
+            self.desc_input.setEnabled(True)
+            self.desc_input.setPlaceholderText("Enter description for center point...")
+            
+            # Don't enable save button yet - wait for description
+            self.save_btn.setEnabled(False)
+            self.cancel_center_btn.setEnabled(False)
             return
 
-        desc = self.desc_input.toPlainText().strip()
-        if not desc:
-            QMessageBox.warning(self, "Warning", "Please enter a description.")
-            return
-
-        # Ensure screenshot is saved to get path for duplicate check
-        if self.current_screenshot_path is None:
-            if self.current_img_bytes is None:
-                QMessageBox.critical(self, "Error", "No image data available to save.")
+        # If we have a center point, save it
+        if self.center_point is not None and self.current_screenshot_path is not None:
+            desc = self.desc_input.toPlainText().strip()
+            if not desc:
+                QMessageBox.warning(self, "Warning", "Please enter a description for the center point.")
                 return
-            timestamp = int(time.time())
-            filename = f"screenshot_{timestamp}.png"
-            img_path = IMAGES_DIR / filename
-            try:
-                with open(img_path, "wb") as f:
-                    f.write(self.current_img_bytes)
-            except OSError as exc:
-                QMessageBox.critical(self, "Error", f"Failed to save image: {exc}")
-                return
-            self.current_screenshot_path = img_path
-
-        # Confirm if description unchanged for same screenshot
-        if (
-            desc == self.last_description
-            and self.current_screenshot_path is not None
-            and self.last_saved_screenshot == self.current_screenshot_path.name
-            and desc != ""
-        ):
-            reply = QMessageBox.question(
-                self,
-                "Confirm Save",
-                "You have already used this description. Save again with the same description?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if reply == QMessageBox.No:
-                return
-
-        # Points list is finalised
-        points_payload = [
-            {"x": p[0], "y": p[1]} for p in self.pending_points
-        ]
-        # (Deferred screenshot saving is handled above)
-
-        entry: Dict[str, Any] = {
-            "screenshot": self.current_screenshot_path.name,
-            "timestamp": int(time.time()),
-            "points": points_payload,
-            "description": desc,
-        }
-        self._append_annotation(entry)
-
-        # Commit the temp pixmap as new base
-        self.base_pixmap = self.image_label.pixmap().copy()
-
-        # Remember last description and screenshot
-        self.last_description = desc
-        if self.current_screenshot_path is not None:
-            self.last_saved_screenshot = self.current_screenshot_path.name
-
-        # Clear input state
-        self._reset_input_section()
+            
+            center_entry = {
+                "screenshot": self.current_screenshot_path.name,
+                "timestamp": int(time.time()),
+                "center_point": {"x": self.center_point[0], "y": self.center_point[1]},
+                "description": desc
+            }
+            
+            self._append_center_point(center_entry)
+            
+            # Upload files to server after saving center point
+            if self.current_screenshot_path is not None:
+                self.upload_to_server(self.current_screenshot_path, CUBE_ANNOTATIONS_PATH, CENTER_POINTS_PATH)
+            
+            # Exit center point mode and reset everything
+            self.center_point = None
+            self.save_btn.setEnabled(False)
+            self.cancel_center_btn.setEnabled(False)
+            
+            # Disable center point spin boxes
+            self.center_x_spin.setEnabled(False)
+            self.center_y_spin.setEnabled(False)
+            
+            # Clear description and reset input section
+            self.desc_input.clear()
+            self._reset_input_section()
 
     def handle_cancel_annotation(self):
         """Cancel pending annotation and revert to last saved state."""
@@ -373,13 +476,29 @@ class MainWindow(QMainWindow):
         # Adjust height in case user reduced content manually
         self._set_desc_height(max(self.desc_input.document().blockCount(), self.desc_min_lines))
         self.point_count_label.setText("Points: 0/4")
-        for w in (self.desc_input, self.save_btn, self.cancel_btn, self.undo_btn, self.redo_btn, self.zoom_in_btn, self.zoom_out_btn):
-            w.setEnabled(False)
+        
+        # Don't disable zoom buttons if we have a center point (in center point mode)
+        if self.center_point is None:
+            # Normal mode - disable all buttons
+            for w in (self.desc_input, self.save_btn, self.cancel_btn, self.undo_btn, self.redo_btn, self.zoom_in_btn, self.zoom_out_btn):
+                w.setEnabled(False)
+        else:
+            # Center point mode - keep zoom buttons enabled, disable cube-related buttons
+            for w in (self.desc_input, self.save_btn, self.cancel_btn, self.undo_btn, self.redo_btn):
+                w.setEnabled(False)
+            # Keep zoom buttons enabled
+            self.zoom_in_btn.setEnabled(True)
+            self.zoom_out_btn.setEnabled(True)
+            # Don't disable center point buttons here - let check_description_for_center_point handle them
 
         # Disable spin boxes
         for x_spin, y_spin in self.point_spin_boxes:
             x_spin.setEnabled(False)
             y_spin.setEnabled(False)
+
+        # Disable center point spin boxes
+        self.center_x_spin.setEnabled(False)
+        self.center_y_spin.setEnabled(False)
 
         # Clear stacks
         self.undo_stack.clear()
@@ -395,6 +514,14 @@ class MainWindow(QMainWindow):
         y_val = round(self.point_spin_boxes[idx][1].value(), 6)
         self.pending_points[idx] = (x_val, y_val)
         self._redraw_preview()
+
+    def on_center_spin_changed(self):
+        """Update center point when spin boxes are edited."""
+        if self.center_point is not None:
+            x_val = round(self.center_x_spin.value(), 6)
+            y_val = round(self.center_y_spin.value(), 6)
+            self.center_point = (x_val, y_val)
+            self._redraw_preview()
 
     # Legacy stub kept for compatibility
     def update_preview_from_spin(self):
@@ -431,6 +558,19 @@ class MainWindow(QMainWindow):
         if len(pixel_points) == 4:
             painter.drawLine(pixel_points[3], pixel_points[0])
 
+        # Draw center point if it exists
+        if self.center_point is not None:
+            center_x = int(self.center_point[0] * width)
+            center_y = int(self.center_point[1] * height)
+            # Draw center point with a different color (blue) and larger size
+            painter.setPen(QPen(Qt.blue, 3))
+            painter.setBrush(Qt.blue)
+            painter.drawEllipse(center_x - 6, center_y - 6, 12, 12)
+            painter.drawText(center_x + 15, center_y + 4, "C")
+            # Reset pen and brush for other elements
+            painter.setPen(QPen(Qt.red, 4))
+            painter.setBrush(Qt.red)
+
         painter.end()
 
         self.image_label.setPixmap(temp_pixmap)
@@ -452,12 +592,12 @@ class MainWindow(QMainWindow):
         self.desc_input.setFixedHeight((line_height * lines) + 10)
 
     # ----------------- Persistence -----------------
-    def _append_annotation(self, entry: Dict[str, Any]):
-        """Append a new annotation entry to the annotations file."""
+    def _append_cube_annotation(self, entry: Dict[str, Any]):
+        """Append a new cube annotation entry to the cumulative cube annotations file."""
         existing: List[Dict[str, Any]]
-        if ANNOTATIONS_PATH.exists():
+        if CUBE_ANNOTATIONS_PATH.exists():
             try:
-                with open(ANNOTATIONS_PATH, "r", encoding="utf-8") as f:
+                with open(CUBE_ANNOTATIONS_PATH, "r", encoding="utf-8") as f:
                     existing = json.load(f)
             except (json.JSONDecodeError, OSError):
                 existing = []
@@ -466,10 +606,114 @@ class MainWindow(QMainWindow):
 
         existing.append(entry)
         try:
-            with open(ANNOTATIONS_PATH, "w", encoding="utf-8") as f:
+            with open(CUBE_ANNOTATIONS_PATH, "w", encoding="utf-8") as f:
                 json.dump(existing, f, indent=2)
         except OSError as exc:
-            QMessageBox.warning(self, "Warning", f"Failed to write annotations: {exc}")
+            QMessageBox.warning(self, "Warning", f"Failed to write cube annotations: {exc}")
+
+    def _calculate_center_point(self, points_payload: List[Dict[str, float]]):
+        """Calculate center point by connecting diagonals of the 4-point rectangle."""
+        if len(points_payload) != 4:
+            return
+        
+        # Extract x and y coordinates
+        x_coords = [p["x"] for p in points_payload]
+        y_coords = [p["y"] for p in points_payload]
+        
+        # Calculate center point (average of all points)
+        center_x = sum(x_coords) / 4.0
+        center_y = sum(y_coords) / 4.0
+        
+        self.center_point = (round(center_x, 6), round(center_y, 6))
+        
+        # Update center point spin boxes
+        self.center_x_spin.blockSignals(True)
+        self.center_y_spin.blockSignals(True)
+        self.center_x_spin.setValue(center_x)
+        self.center_y_spin.setValue(center_y)
+        self.center_x_spin.setEnabled(True)
+        self.center_y_spin.setEnabled(True)
+        self.center_x_spin.blockSignals(False)
+        self.center_y_spin.blockSignals(False)
+        
+        self._redraw_preview()
+
+    def cancel_center_point(self):
+        """Cancel the center point mode and reset the center point."""
+        self.center_point = None
+        self.save_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+        
+        # Disable center point spin boxes
+        self.center_x_spin.setEnabled(False)
+        self.center_y_spin.setEnabled(False)
+        
+        QMessageBox.information(self, "Center Point Mode", "Center point process cancelled.")
+        self._reset_input_section()
+
+    def _append_center_point(self, entry: Dict[str, Any]):
+        """Append a new center point entry to the cumulative center points file."""
+        existing: List[Dict[str, Any]]
+        if CENTER_POINTS_PATH.exists():
+            try:
+                with open(CENTER_POINTS_PATH, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                existing = []
+        else:
+            existing = []
+
+        existing.append(entry)
+        try:
+            with open(CENTER_POINTS_PATH, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2)
+        except OSError as exc:
+            QMessageBox.warning(self, "Warning", f"Failed to write center point: {exc}")
+
+    def upload_to_server(self, image_path: Path, cube_annotations_json: Path, center_points_json: Path, server_url: str = "http://localhost:8000"):
+        """
+        Upload screenshot image and both JSON annotation files to the FastAPI server.
+        
+        Args:
+            image_path: Path to the screenshot image file
+            cube_annotations_json: Path to the cube annotations JSON file
+            center_points_json: Path to the center points JSON file
+            server_url: URL of the FastAPI server (default: localhost:8000)
+        """
+        try:
+            # Prepare files for upload
+            with open(image_path, 'rb') as img_file, \
+                 open(cube_annotations_json, 'rb') as ann_file, \
+                 open(center_points_json, 'rb') as center_file:
+                
+                files = {
+                    'image': (image_path.name, img_file, 'image/png'),
+                    'annotations': (cube_annotations_json.name, ann_file, 'application/json'),
+                    'center_points': (center_points_json.name, center_file, 'application/json')
+                }
+                
+                # Send POST request to server
+                response = requests.post(f"{server_url}/upload/", files=files, timeout=30)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    print(f"✅ Upload successful!")
+                    print(f"   Timestamp: {result['timestamp']}")
+                    print(f"   Image saved: {result['files']['image']}")
+                    print(f"   Annotations saved: {result['files']['annotations']}")
+                    print(f"   Center points saved: {result['files']['center_points']}")
+                else:
+                    print(f"❌ Upload failed with status code: {response.status_code}")
+                    print(f"   Error: {response.text}")
+                    
+        except requests.exceptions.ConnectionError:
+            print("❌ Connection error: Could not connect to server. Make sure the server is running on localhost:8000")
+        except requests.exceptions.Timeout:
+            print("❌ Timeout error: Server took too long to respond")
+        except FileNotFoundError as e:
+            print(f"❌ File not found: {e}")
+        except Exception as e:
+            print(f"❌ Upload error: {e}")
 
     # ---------------- Undo / Redo ------------------
 
@@ -524,15 +768,26 @@ class MainWindow(QMainWindow):
         self.undo_btn.setEnabled(len(self.pending_points) > 0)
         self.redo_btn.setEnabled(len(self.redo_stack) > 0)
         self.cancel_btn.setEnabled(len(self.pending_points) > 0)
-        # Save enabled only if 4 points
-        self.save_btn.setEnabled(len(self.pending_points) == 4)
-        self.desc_input.setEnabled(len(self.pending_points) == 4)
+        
+        # Save button logic: enabled for 4 points with description OR for center point with description
+        if len(self.pending_points) == 4:
+            # Enable save for cube annotation if description is provided
+            desc = self.desc_input.toPlainText().strip()
+            self.save_btn.setEnabled(bool(desc))
+            self.desc_input.setEnabled(True)
+        elif self.center_point is not None:
+            # For center point, let check_description_for_center_point handle save button
+            pass
+        else:
+            # Disable save button
+            self.save_btn.setEnabled(False)
+            self.desc_input.setEnabled(False)
 
     # ----------------- Zoom Handling -----------------
 
     def _zoom(self, factor: float):
         """Zoom the image by a given factor (>1 zooms in, <1 zooms out)."""
-        if self.base_pixmap is None or self.original_pixmap is None:
+        if self.original_pixmap is None:
             return
 
         new_scale = self.current_scale * factor
@@ -543,13 +798,15 @@ class MainWindow(QMainWindow):
 
         self.current_scale = new_scale
 
-        # Rescale the base pixmap (which includes saved dots)
+        # Scale from the original pixmap to maintain resolution
         target_w = int(self.original_pixmap.width() * self.current_scale)
         target_h = int(self.original_pixmap.height() * self.current_scale)
 
-        scaled_base = self.base_pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        # Create a new base pixmap from the original (without drawn points)
+        scaled_base = self.original_pixmap.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.base_pixmap = scaled_base
 
+        # Redraw the preview with current points
         self._redraw_preview()
 
         # Adjust scroll area widget size
@@ -597,6 +854,25 @@ class MainWindow(QMainWindow):
         if self._drag_index is not None:
             self._drag_index = None
             self._redraw_preview()
+
+    def check_description_for_center_point(self):
+        """Enable save button if description is provided for center point."""
+        desc = self.desc_input.toPlainText().strip()
+        if desc and self.center_point is not None:
+            # Enable unified save button
+            self.save_btn.setEnabled(True)
+            # Enable cancel center point button
+            self.cancel_center_btn.setEnabled(True)
+        else:
+            # Disable buttons if no description
+            self.save_btn.setEnabled(False)
+            self.cancel_center_btn.setEnabled(False)
+
+    def update_save_button_state(self):
+        """Enable save button if description is provided for cube annotations."""
+        desc = self.desc_input.toPlainText().strip()
+        if len(self.pending_points) == 4:
+            self.save_btn.setEnabled(bool(desc))
 
 
 def main() -> None:
