@@ -6,5 +6,8 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "adbutils>=2.9.3",
-    "PyQt5>=5.15.9"
+    "PyQt5>=5.15.9",
+    "pillow",
+    "requests>=2.31.0",
+    "typing-extensions"
 ]
